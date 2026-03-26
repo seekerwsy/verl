@@ -75,6 +75,13 @@ class vLLMRollout(BaseRollout):
         assert tensor_parallel_size <= torch.distributed.get_world_size(), \
             "tensor parallel size should be less than or equal to the world size"
         max_num_batched_tokens = int(self.config.get('max_num_batched_tokens', 8192))
+        max_num_seqs = int(self.config.get('max_num_seqs', 1024))
+        if max_num_batched_tokens < max_num_seqs:
+            print(
+                f"Warning: clamping max_num_seqs from {max_num_seqs} to {max_num_batched_tokens} "
+                "because vLLM requires max_num_batched_tokens >= max_num_seqs."
+            )
+            max_num_seqs = max_num_batched_tokens
 
         if kwargs.get('train_tp', None) is not None:
             # deployed with megatron
@@ -111,6 +118,7 @@ class vLLMRollout(BaseRollout):
             load_format=config.load_format,
             disable_log_stats=config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=max_num_seqs,
             enable_chunked_prefill=config.enable_chunked_prefill,
         )
 

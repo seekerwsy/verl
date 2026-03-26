@@ -754,6 +754,10 @@ class RayPPOTrainer(object):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch['attention_mask']
         batch_size = attention_mask.shape[0]
+        if batch_size == 0:
+            metrics[f'{logging_prefix}/empty_batch'] = 1
+            print('Warning: skip _balance_batch because batch is empty.')
+            return
         global_seqlen_lst = batch.batch['attention_mask'].view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
         world_size = self.actor_rollout_wg.world_size
         global_partition_lst = get_seqlen_balanced_partitions(global_seqlen_lst,
@@ -919,6 +923,18 @@ class RayPPOTrainer(object):
                             total_batch = total_batch[:traj_bsz]
                             num_cumulated_nonzero_prompt = self.config.data.train_batch_size
 
+                        if total_batch is None or len(total_batch) == 0:
+                            metrics["train/empty_batch_after_filter_groups"] = 1
+                            print(
+                                "Warning: empty batch after DAPO filter_groups aggregation; skipping this training step. "
+                                "This is more likely with very small train_batch_size or low-variance rewards."
+                            )
+                            total_batch = None
+                            num_substeps = 0
+                            num_checked_prompt_per_step = 0
+                            num_cumulated_nonzero_prompt = 0
+                            continue
+
                         metrics["train/num_checked_prompt"] = num_checked_prompt_per_step
                         metrics["train/num_nonzero_prompt"] = num_cumulated_nonzero_prompt
                         self.last_prompt_utilization = num_cumulated_nonzero_prompt / num_checked_prompt_per_step
@@ -929,6 +945,11 @@ class RayPPOTrainer(object):
                         num_substeps = 0
                         num_checked_prompt_per_step = 0
                         num_cumulated_nonzero_prompt = 0
+
+                    if len(batch) == 0:
+                        metrics["train/empty_batch_before_response_mask"] = 1
+                        print("Warning: empty batch before response_mask; skipping this training step.")
+                        continue
 
                     batch.batch['response_mask'] = compute_response_mask(batch)
                     # balance the number of valid tokens on each dp rank.

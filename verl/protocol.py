@@ -109,6 +109,38 @@ def list_of_dict_to_dict_of_list(list_of_dict: list[dict]):
     return output
 
 
+def to_object_1d_array(values) -> np.ndarray:
+    """Convert batched non-tensor values to a stable 1D object ndarray.
+
+    This avoids numpy inferring higher-rank object arrays when inner elements
+    share the same shape by coincidence (e.g. list[list[int]]).
+    """
+    if isinstance(values, np.ndarray):
+        arr = values
+        if arr.dtype != object:
+            arr = arr.astype(object)
+    else:
+        arr = np.asarray(values, dtype=object)
+
+    if arr.ndim == 0:
+        out = np.empty((1, ), dtype=object)
+        out[0] = arr.item()
+        return out
+
+    if arr.ndim == 1:
+        if arr.dtype == object:
+            return arr
+        out = np.empty((arr.shape[0], ), dtype=object)
+        out[:] = arr.tolist()
+        return out
+
+    # Collapse any inferred extra dimensions into per-sample objects.
+    out = np.empty((arr.shape[0], ), dtype=object)
+    for i in range(arr.shape[0]):
+        out[i] = arr[i]
+    return out
+
+
 def fold_batch_dim(data: 'DataProto', new_batch_size):
     """
     Fold a batch dim from [bsz, xxx] into [new_bsz, bsz // new_bsz, xxx]
@@ -157,7 +189,7 @@ def collate_fn(x: list['DataProtoItem']):
     batch = torch.stack(batch).contiguous()
     non_tensor_batch = list_of_dict_to_dict_of_list(non_tensor_batch)
     for key, val in non_tensor_batch.items():
-        non_tensor_batch[key] = np.array(val, dtype=object)
+        non_tensor_batch[key] = to_object_1d_array(val)
     return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
 
@@ -373,7 +405,7 @@ class DataProto:
                     f'Not all the tensor in tensors have the same batch size with batch_dims={num_batch_dims}. Got {pivot_key} has {batch_size}, {key} has {current_batch}'
 
         for key, val in non_tensors.items():
-            non_tensors[key] = np.array(val, dtype=object)
+            non_tensors[key] = to_object_1d_array(val)
 
         tensor_dict = TensorDict(source=tensors, batch_size=batch_size)
         return cls(batch=tensor_dict, non_tensor_batch=non_tensors, meta_info=meta_info)
@@ -596,7 +628,15 @@ class DataProto:
 
         non_tensor_batch = list_of_dict_to_dict_of_list(list_of_dict=[d.non_tensor_batch for d in data])
         for key, val in non_tensor_batch.items():
-            non_tensor_batch[key] = np.concatenate(val, axis=0)
+            normalized_val = [to_object_1d_array(v) for v in val]
+            try:
+                non_tensor_batch[key] = np.concatenate(normalized_val, axis=0)
+            except ValueError as e:
+                shape_str = [getattr(v, 'shape', None) for v in normalized_val]
+                raise ValueError(
+                    f'Failed to concatenate non_tensor_batch["{key}"] with shapes {shape_str}. '
+                    'This usually means some batches produced inconsistent non-tensor structures.'
+                ) from e
 
         return DataProto(batch=new_batch, non_tensor_batch=non_tensor_batch, meta_info=data[0].meta_info)
 

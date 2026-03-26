@@ -43,7 +43,18 @@ def collate_fn(data_list: list[dict]) -> dict:
         tensors[key] = torch.stack(val, dim=0)
 
     for key, val in non_tensors.items():
-        non_tensors[key] = np.array(val, dtype=object)
+        arr = np.asarray(val, dtype=object)
+        if arr.ndim == 0:
+            out = np.empty((1, ), dtype=object)
+            out[0] = arr.item()
+            non_tensors[key] = out
+        elif arr.ndim == 1:
+            non_tensors[key] = arr
+        else:
+            out = np.empty((arr.shape[0], ), dtype=object)
+            for i in range(arr.shape[0]):
+                out[i] = arr[i]
+            non_tensors[key] = out
 
     return {**tensors, **non_tensors}
 

@@ -410,8 +410,15 @@ class RayPPOTrainer(object):
         else:
             sampler = SequentialSampler(data_source=self.train_dataset)
 
+        train_loader_batch_size = max(1, self.config.data.train_batch_size // 4)
+        if train_loader_batch_size != self.config.data.train_batch_size // 4:
+            print(
+                f"WARNING: train dataloader batch_size underflow ({self.config.data.train_batch_size} // 4 = 0). "
+                f"Using batch_size={train_loader_batch_size} instead."
+            )
+
         self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
-                                                   batch_size=self.config.data.train_batch_size // 4,
+                                                   batch_size=train_loader_batch_size,
                                                    num_workers=8,
                                                    drop_last=True,
                                                    collate_fn=collate_fn,
@@ -729,6 +736,11 @@ class RayPPOTrainer(object):
         if os.path.exists(os.path.join(global_step_folder, 'step_prompt_utilization.txt')):
             with open(os.path.join(global_step_folder, 'step_prompt_utilization.txt'), 'r') as f:
                 self.last_prompt_utilization = float(f.read().strip())
+            if self.last_prompt_utilization <= 0:
+                print(
+                    f"Warning: invalid resumed prompt utilization ({self.last_prompt_utilization}), reset to 1.0"
+                )
+                self.last_prompt_utilization = 1.0
             print(f'Last prompt utilization from resumed checkpoint: {self.last_prompt_utilization}')
 
         actor_path = os.path.join(global_step_folder, 'actor')
@@ -812,8 +824,9 @@ class RayPPOTrainer(object):
                 timing_raw = {}
                 num_cumulated_nonzero_prompt = 0
                 num_checked_prompt_per_step = 0
+                safe_prompt_utilization = max(self.last_prompt_utilization, 1e-6)
                 estimated_prompt_size = min(self.config.data.train_batch_size * self.config.data.max_roll_factor,
-                                            self.config.data.train_batch_size / self.last_prompt_utilization)
+                                            self.config.data.train_batch_size / safe_prompt_utilization)
                 batch_list = []
                 for batch_dict in self.train_dataloader:
                     batch: DataProto = DataProto.from_single_dict(batch_dict)
@@ -847,13 +860,23 @@ class RayPPOTrainer(object):
                 with _timer('step', timing_raw):
                     # generate a batch
                     with _timer('gen', timing_raw):
-                        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                        gen_batch_padded, gen_pad_size = pad_dataproto_to_divisor(
+                            gen_batch, self.actor_rollout_wg.world_size)
+                        gen_batch_output_padded = self.actor_rollout_wg.generate_sequences(gen_batch_padded)
+                        # rollout outputs are expanded by n samples per prompt; trim padded prompts accordingly.
+                        gen_output_pad_size = gen_pad_size * int(self.config.actor_rollout_ref.rollout.n)
+                        gen_batch_output = unpad_dataproto(gen_batch_output_padded, pad_size=gen_output_pad_size)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer('gen_max', timing_raw):
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info['do_sample'] = False
-                            gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
+                            gen_baseline_batch_padded, gen_baseline_pad_size = pad_dataproto_to_divisor(
+                                gen_baseline_batch, self.actor_rollout_wg.world_size)
+                            gen_baseline_output_padded = self.actor_rollout_wg.generate_sequences(
+                                gen_baseline_batch_padded)
+                            gen_baseline_output = unpad_dataproto(gen_baseline_output_padded,
+                                                                  pad_size=gen_baseline_pad_size)
 
                             batch = batch.union(gen_baseline_output)
                             reward_baseline_tensor = self.reward_fn(batch)
@@ -916,14 +939,16 @@ class RayPPOTrainer(object):
 
                         metrics["train/num_checked_prompt"] = num_checked_prompt_per_step
                         metrics["train/num_nonzero_prompt"] = num_cumulated_nonzero_prompt
-                        self.last_prompt_utilization = num_cumulated_nonzero_prompt / num_checked_prompt_per_step
-                        metrics["train/ratio_nonzero_propmt"] = self.last_prompt_utilization
+                        current_prompt_utilization = num_cumulated_nonzero_prompt / num_checked_prompt_per_step
+                        metrics["train/ratio_nonzero_propmt"] = current_prompt_utilization
 
                         if num_cumulated_nonzero_prompt == 0:
                             print(
                                 f"Warning: No prompt left after filtering, please check your reward function and filter_groups settings."
                             )
                             continue
+
+                        self.last_prompt_utilization = current_prompt_utilization
 
                     batch.batch['response_mask'] = compute_response_mask(batch)
                     # balance the number of valid tokens on each dp rank.
